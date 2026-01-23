@@ -8,7 +8,32 @@ c.features = {}
 c.advanced = {}
 
 -- Paths
-c.paths.yabai                         = '/usr/local/bin/yabai'
+-- Auto-detect yabai path based on architecture (Apple Silicon vs Intel)
+local function detectYabaiPath()
+    -- Check Apple Silicon path first (more common on new Macs)
+    local applesilicon_path = '/opt/homebrew/bin/yabai'
+    local intel_path = '/usr/local/bin/yabai'
+    
+    if hs.fs.attributes(applesilicon_path) then
+        return applesilicon_path
+    elseif hs.fs.attributes(intel_path) then
+        return intel_path
+    else
+        -- Fallback: try to find yabai in PATH
+        local handle = io.popen('which yabai 2>/dev/null')
+        if handle then
+            local result = handle:read('*a'):gsub('%s+$', '')
+            handle:close()
+            if result ~= '' then
+                return result
+            end
+        end
+        -- Default to Intel path if nothing found
+        return intel_path
+    end
+end
+
+c.paths.yabai                         = detectYabaiPath()
 
 -- Appearance
 c.appearance.color                    = { white = 0.90 }    -- Indicator background color, e.g., {red = 0.5, blue = 0 }

@@ -107,6 +107,7 @@ local function shouldRestack(new) -- {{{
     --  • changes to existing stack
     --    • change position
     --    • change num windows (win added / removed)
+    --    • change window order (swap operation)
 
     local curr = stackline.manager:getSummary()
     new = stackline.manager:getSummary(u.values(new))
@@ -124,6 +125,12 @@ local function shouldRestack(new) -- {{{
 
     if not u.equal(curr.numWindows, new.numWindows) then
         log.i('Should refresh -> Windows changed')
+        return true
+    end
+
+    -- Detect stack window swap/reorder operations
+    if not u.equal(curr.stackOrder, new.stackOrder) then
+        log.i('Should refresh -> Stack order changed (swap detected)')
         return true
     end
 
