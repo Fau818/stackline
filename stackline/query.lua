@@ -34,6 +34,23 @@ local function getStackedWinIds(byStack) -- {{{
     return stackedWinIds
 end  -- }}}
 
+local function getStackOrderFromWindows(byStack, winStackIdxs) -- {{{
+    -- Build a map of stackId -> ordered window IDs based on yabai stack-index
+    local result = {}
+    for stackId, windows in pairs(byStack) do
+        local ordered = {}
+        for _, win in pairs(windows) do
+            local stackIdx = winStackIdxs[tostring(win.id)] or 0
+            table.insert(ordered, {id = win.id, stackIdx = stackIdx})
+        end
+        table.sort(ordered, function(a, b)
+            return a.stackIdx < b.stackIdx
+        end)
+        result[stackId] = u.map(ordered, function(w) return w.id end)
+    end
+    return result
+end  -- }}}
+
 local function groupWindows(ws) -- {{{
     -- Given windows from hs.window.filter:
     --    1. Create stackline window objects
@@ -107,7 +124,7 @@ local function shouldRestack(new) -- {{{
     --  • changes to existing stack
     --    • change position
     --    • change num windows (win added / removed)
-    --    • change window order (swap operation)
+    -- NOTE: Stack order (swap) is checked separately after yabai query
 
     local curr = stackline.manager:getSummary()
     new = stackline.manager:getSummary(u.values(new))
@@ -128,12 +145,6 @@ local function shouldRestack(new) -- {{{
         return true
     end
 
-    -- Detect stack window swap/reorder operations
-    if not u.equal(curr.stackOrder, new.stackOrder) then
-        log.i('Should refresh -> Stack order changed (swap detected)')
-        return true
-    end
-
     log.i('Should not redraw.')
 end -- }}}
 
@@ -144,6 +155,9 @@ local function run(opts) -- {{{
     -- Check if space has stacks...
     local spaceHasStacks  = stackline.manager:getSummary().numStacks > 0
 
+    -- Get current stack order before querying yabai (for swap detection)
+    local currStackOrder = stackline.manager:getStackOrder()
+
     local shouldRefresh = spaceHasStacks and shouldRestack(byStack) -- Don't even check on a space that doesn't have any stacks
 
     if shouldRefresh or opts.forceRedraw then
@@ -153,11 +167,34 @@ local function run(opts) -- {{{
 
         yabai(yabai_cmd, function(yabaiRes)
             local winStackIdxs = stackIdMapper(yabaiRes)
+            local mergedStacks = mergeWinStackIdxs(byStack, winStackIdxs)
+            
+            -- Check if stack order changed (swap detection)
+            local newStackOrder = getStackOrderFromWindows(mergedStacks, winStackIdxs)
+            local orderChanged = not u.equal(currStackOrder, newStackOrder)
+            
+            if orderChanged then
+                log.i('Stack order changed (swap detected) - forcing redraw')
+            end
+            
             stackline.manager:ingest( -- hand over to stackmanager
-                mergeWinStackIdxs(byStack, winStackIdxs), -- Add the stack indexes from yabai to byStack
+                mergedStacks,
                 byApp,
-                spaceHasStacks
+                spaceHasStacks or orderChanged
             )
+        end)
+    elseif spaceHasStacks then
+        -- Even if shouldRestack is false, check for swap by querying yabai
+        local yabai_cmd = 'query --windows'
+        yabai(yabai_cmd, function(yabaiRes)
+            local winStackIdxs = stackIdMapper(yabaiRes)
+            local newStackOrder = getStackOrderFromWindows(byStack, winStackIdxs)
+            
+            if not u.equal(currStackOrder, newStackOrder) then
+                log.i('Stack order changed (swap detected) - refreshing')
+                local mergedStacks = mergeWinStackIdxs(byStack, winStackIdxs)
+                stackline.manager:ingest(mergedStacks, byApp, true)
+            end
         end)
     end
 end -- }}}

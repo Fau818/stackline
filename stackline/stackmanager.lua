@@ -72,20 +72,23 @@ function Stackmanager:getSummary(external) -- {{{
             local windows = external and s or s.windows
             return #windows
         end),
-        -- Track window order within stacks to detect swap operations
-        stackOrder = u.map(stacks, function(s)
-            local windows = external and s or s.windows
-            -- Create ordered list of window IDs by their stack index
-            local ordered = {}
-            for _, w in pairs(windows) do
-                table.insert(ordered, {id = w.id, stackIdx = w.stackIdx})
-            end
-            table.sort(ordered, function(a, b)
-                return (a.stackIdx or 0) < (b.stackIdx or 0)
-            end)
-            return u.map(ordered, function(w) return w.id end)
-        end),
     }
+end -- }}}
+
+function Stackmanager:getStackOrder() -- {{{
+    -- Returns a map of stackId -> ordered window IDs for swap detection
+    local result = {}
+    for _, stack in pairs(self.tabStacks) do
+        local ordered = {}
+        for _, win in pairs(stack.windows) do
+            table.insert(ordered, {id = win.id, stackIdx = win.stackIdx or 0})
+        end
+        table.sort(ordered, function(a, b)
+            return a.stackIdx < b.stackIdx
+        end)
+        result[stack.id] = u.map(ordered, function(w) return w.id end)
+    end
+    return result
 end -- }}}
 
 function Stackmanager:resetAllIndicators() -- {{{
