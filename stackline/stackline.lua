@@ -135,7 +135,14 @@ function stackline.redrawWinIndicator(hsWin, _app, _evt) -- {{{
     ]]
     local stackedWin = stackline.manager:findWindow(hsWin:id())
     if not stackedWin then return end -- if non-existent, the focused win is not stacked
+    
+    -- Redraw the focused window's indicator
     stackedWin:redrawIndicator()
+    
+    -- Also redraw other windows in the same stack to update their unfocused state
+    if stackedWin.stack then
+        stackedWin.stack:redrawAllIndicators({except = stackedWin.id})
+    end
 end -- }}}
 
 function stackline:setLogLevel(lvl) -- {{{
