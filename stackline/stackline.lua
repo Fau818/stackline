@@ -150,6 +150,13 @@ function stackline:setLogLevel(lvl) -- {{{
     log.i( ('Window.log level set to %s'):format(lvl) )
 end -- }}}
 
+function stackline:refresh() -- {{{
+    -- Force refresh stackline - call this from yabai signal or keybinding
+    -- Usage: hs -c 'stackline:refresh()'
+    log.i('stackline:refresh() called')
+    self.manager:update({forceRedraw = true})
+end -- }}}
+
 stackline.spaceWatcher = hs.spaces.watcher.new( -- {{{
     function(spaceIdx)
         -- QUESTION: do I need to clean this up? If so, how?
