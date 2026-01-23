@@ -66,33 +66,30 @@ function Stack:deleteAllIndicators() -- {{{
 end -- }}}
 
 function Stack:getWindowByPoint(p)
-   if p.x < 0 or p.y < 0 then
-      -- FIX: https://github.com/AdamWagner/stackline/issues/62
-      -- NOTE: Window indicator frame coordinates are relative to the window's screen.
-      -- So, if click point has negative X or Y vals, then convert its coordinates
-      -- to relative to the clicked screen before comparing to window indicator frames.
-      -- TODO: Clean this up after fix is confirmed
-
-      -- Get the screen with frame that contains point 'p'
-      local function findClickedScreen(_p) -- {{{
-         return table.unpack(
-            u.filter(hs.screen.allScreens(), function(s)
-               return _p:inside(s:frame())
-            end)
-         )
-      end -- }}}
-
-      local clickedScren = findClickedScreen(p)
-      p = clickedScren
-         and clickedScren:absoluteToLocal(p)
-         or p
+   -- FIX: https://github.com/AdamWagner/stackline/issues/100
+   -- Window indicator frame coordinates are relative to the window's screen.
+   -- We need to convert click coordinates to be relative to the stack's screen,
+   -- not just any screen with negative coordinates.
+   
+   -- Get the stack's screen (all windows in stack share the same screen)
+   local stackScreen = self.windows[1] and self.windows[1]._win and self.windows[1]._win:screen()
+   if not stackScreen then return nil end
+   
+   -- Check if click point is on the stack's screen
+   local stackFrame = stackScreen:frame()
+   if not p:inside(stackFrame) then
+      -- Click is not on the stack's screen, so it can't be clicking an indicator
+      return nil
    end
+   
+   -- Convert click point to stack screen's local coordinates
+   local localPoint = stackScreen:absoluteToLocal(p)
 
    return table.unpack(
          u.filter(self.windows, function(w)
           local indicatorFrame = w.indicator and w.indicator:canvasElements()[1].frame
           if not indicatorFrame then return false end
-          return p:inside(indicatorFrame) -- NOTE: frame *must* be a hs.geometry.rect instance
+          return localPoint:inside(indicatorFrame) -- NOTE: frame *must* be a hs.geometry.rect instance
       end)
    )
 end

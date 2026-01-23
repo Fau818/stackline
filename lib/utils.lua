@@ -235,6 +235,27 @@ function u.extend(t1, t2) -- {{{
     return t1
 end -- }}}
 
+function u.deepMerge(default, override) -- {{{
+    -- Recursively merge override into default, preserving unset defaults
+    -- Fixes https://github.com/AdamWagner/stackline/issues/127
+    if not override then return default end
+    if not default then return override end
+    
+    local result = u.deepCopy(default)
+    
+    for k, v in pairs(override) do
+        if u.istable(v) and u.istable(result[k]) and not u.isarray(v) then
+            -- Recursively merge nested tables (but not arrays)
+            result[k] = u.deepMerge(result[k], v)
+        else
+            -- Override value directly
+            result[k] = v
+        end
+    end
+    
+    return result
+end -- }}}
+
 function u.include(tbl, val) -- {{{
     for _k, v in ipairs(tbl) do
         if u.equal(v,val) then

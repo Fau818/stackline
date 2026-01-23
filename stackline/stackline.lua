@@ -18,8 +18,8 @@ function stackline:init(userConfig) -- {{{
         return log.i'stackline already initialized'
     end
 
-    -- init config with default settings + user overrides
-    self.config:init(u.extend(require 'stackline.conf', userConfig or {}))
+    -- init config with default settings + user overrides (deep merge preserves defaults)
+    self.config:init(u.deepMerge(require 'stackline.conf', userConfig or {}))
 
     -- init stackmanager, & run update right away
     -- NOTE: Requires self.config to be initialized first
