@@ -1,0 +1,381 @@
+-- A fake `hs` global covering the Hammerspoon APIs stackline uses. `install()` returns a controller
+-- that tests use to drive time, answer hs.task launches, and inspect canvases, logs and notifications.
+local json = require 'test.json'
+
+local M = {}
+
+-- Returns a shallow copy of `t`.
+local function copy(t)
+    local c = {}
+    for k, v in pairs(t or {}) do c[k] = v end
+    return c
+end
+
+-- Returns a compact, deterministic string for `value` (stands in for hs.inspect).
+local function inspect(value, depth)
+    depth = depth or 0
+    if type(value) == 'string' then return ('%q'):format(value) end
+    if type(value) ~= 'table' then return tostring(value) end
+    if depth > 4 then return '{...}' end
+    local keys = {}
+    for k in pairs(value) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = tostring(k) .. ' = ' .. inspect(value[k], depth + 1) end
+    return '{ ' .. table.concat(parts, ', ') .. ' }'
+end
+
+-- Installs a fresh fake `hs` global and returns its controller.
+function M.install()
+    local ctl = {
+        now = 0,                 -- fake clock, seconds
+        timers = {},
+        pendingTasks = {},       -- launched tasks waiting for the controller to complete them
+        hungTasks = {},
+        taskLog = {},            -- every launched hs.task, in order
+        taskHandler = nil,       -- function(path, args, task) -> exitCode, stdout, stderr (exitCode nil = hang)
+        canvases = {},
+        screens = { { id = 1, frame = { x = 0, y = 0, w = 1440, h = 900 } } },
+        files = {},              -- path -> attributes table (mode, ino, change, ...)
+        apps = {},               -- pid -> { name, bundleID, path, windows = { id, ... } }
+        focusedWindows = {},     -- ids focused through hs.window objects
+        notifications = {},
+        logs = {},
+        spacesWatchers = {},
+        screenWatchers = {},
+        imageLookups = 0,
+        appLookups = 0,
+        frameworksPath = '/Applications/Hammerspoon.app/Contents/Frameworks',
+        tmpdir = '/private/var/folders/xy/T/',
+    }
+
+    local hs = {}
+
+    -- hs.logger ----------------------------------------------------------------------------
+    hs.logger = {
+        new = function(name, level)
+            local logger = { name = name, level = level }
+            for _, method in ipairs({ 'e', 'w', 'i', 'd', 'v', 'ef', 'wf', 'f', 'df', 'vf' }) do
+                logger[method] = function(...)
+                    local parts = {}
+                    for i = 1, select('#', ...) do parts[#parts + 1] = tostring((select(i, ...))) end
+                    ctl.logs[#ctl.logs + 1] = { level = method, msg = table.concat(parts, ' ') }
+                end
+            end
+            logger.setLogLevel = function(lvl) logger.level = lvl end
+            logger.getLogLevel = function() return logger.level end
+            return logger
+        end,
+    }
+
+    -- hs.timer -----------------------------------------------------------------------------
+    local function addTimer(delay, fn, every)
+        local timer = { at = ctl.now + delay, fn = fn, every = every, active = true }
+        function timer:stop() self.active = false return self end
+        function timer:running() return self.active end
+        function timer:start() self.active = true; self.at = ctl.now + (self.every or delay) return self end
+        ctl.timers[#ctl.timers + 1] = timer
+        return timer
+    end
+    hs.timer = {
+        doAfter = function(delay, fn) return addTimer(delay, fn) end,
+        doEvery = function(interval, fn) return addTimer(interval, fn, interval) end,
+        absoluteTime = function() return math.floor(ctl.now * 1e9 + 0.5) end,
+        secondsSinceEpoch = function() return 1.7e9 + ctl.now end,
+    }
+
+    -- hs.task --------------------------------------------------------------------------------
+    hs.task = {
+        new = function(path, callback, a, b)
+            local args = (type(a) == 'table') and a or b or {}
+            local task = { path = path, args = args, callback = callback, running = false, terminated = false }
+            function task:start()
+                self.running = true
+                ctl.taskLog[#ctl.taskLog + 1] = self
+                ctl.pendingTasks[#ctl.pendingTasks + 1] = self
+                return self
+            end
+            function task:isRunning() return self.running end
+            function task:terminate()
+                if not self.running then return self end
+                self.running = false
+                self.terminated = true
+                if self.callback then self.callback(15, '', '') end
+                return self
+            end
+            return task
+        end,
+    }
+
+    -- Completes launched tasks (including ones launched by callbacks) until none are pending.
+    function ctl.flushTasks()
+        while #ctl.pendingTasks > 0 do
+            local task = table.remove(ctl.pendingTasks, 1)
+            if task.running then
+                local code, out, err = 0, '', ''
+                if ctl.taskHandler then code, out, err = ctl.taskHandler(task.path, task.args, task) end
+                if code == nil then
+                    ctl.hungTasks[#ctl.hungTasks + 1] = task
+                else
+                    task.running = false
+                    if task.callback then task.callback(code, out or '', err or '') end
+                end
+            end
+        end
+    end
+
+    -- Advances the fake clock by `dt` seconds, completing tasks and firing due timers in order.
+    function ctl.advance(dt)
+        local target = ctl.now + (dt or 0)
+        while true do
+            ctl.flushTasks()
+            local nextTimer
+            for _, t in ipairs(ctl.timers) do
+                if t.active and t.at <= target + 1e-9 and (not nextTimer or t.at < nextTimer.at) then nextTimer = t end
+            end
+            if not nextTimer then break end
+            ctl.now = math.max(ctl.now, nextTimer.at)
+            if nextTimer.every then nextTimer.at = nextTimer.at + nextTimer.every else nextTimer.active = false end
+            nextTimer.fn(nextTimer)
+        end
+        ctl.now = target
+        ctl.flushTasks()
+    end
+
+    -- Returns launched tasks whose argument list contains `needle`.
+    function ctl.tasksMatching(needle)
+        local found = {}
+        for _, task in ipairs(ctl.taskLog) do
+            for _, arg in ipairs(task.args) do
+                if tostring(arg):find(needle, 1, true) then found[#found + 1] = task break end
+            end
+        end
+        return found
+    end
+
+    -- hs.canvas ------------------------------------------------------------------------------
+    local windowLevels = {
+        _MinimumWindowLevelKey = -2147483648, desktop = -2147483623, desktopIcon = -2147483603,
+        normal = 0, floating = 3, tornOffMenu = 3, modalPanel = 8, utility = 19, dock = 20,
+        mainMenu = 24, status = 25, popUpMenu = 101, overlay = 102, help = 200, dragging = 500,
+        screenSaver = 1000, assistiveTechHigh = 1500, cursor = 2147483630, _MaximumWindowLevelKey = 2147483631,
+    }
+    local windowBehaviors = {
+        default = 0, canJoinAllSpaces = 1, moveToActiveSpace = 2, managed = 4, transient = 8, stationary = 16,
+        participatesInCycle = 32, ignoresCycle = 64, fullScreenPrimary = 128, fullScreenAuxiliary = 256,
+    }
+
+    local function newCanvas(frame)
+        assert(type(frame) == 'table' and frame.x and frame.y and frame.w and frame.h, 'canvas frame required')
+        local canvas = {
+            frameRect = copy(frame), elements = {}, showing = false, deleted = false,
+            levelValue = windowLevels.screenSaver, behaviorValue = 0, subrole = nil,
+            clickActivatingValue = true, mouseCallbackFn = nil, attributeWrites = 0,
+        }
+        function canvas:level(v)
+            if v == nil then return self.levelValue end
+            if type(v) == 'string' then
+                assert(windowLevels[v], 'unrecognized level specified: ' .. v)
+                v = windowLevels[v]
+            end
+            self.levelValue = v
+            return self
+        end
+        function canvas:behavior(v)
+            if v == nil then return self.behaviorValue end
+            self.behaviorValue = v
+            return self
+        end
+        function canvas:_accessibilitySubrole(v) self.subrole = v return self end
+        function canvas:clickActivating(v) self.clickActivatingValue = v return self end
+        function canvas:appendElements(...)
+            local list = { ... }
+            if select('#', ...) == 1 and #list[1] > 0 then list = list[1] end
+            assert(#list > 0, 'appendElements called without elements')
+            for _, e in ipairs(list) do self.elements[#self.elements + 1] = copy(e) end
+            return self
+        end
+        function canvas:elementAttribute(i, key, value)
+            assert(self.elements[i], 'no element at index ' .. tostring(i))
+            if value == nil then return self.elements[i][key] end
+            self.elements[i][key] = value
+            self.attributeWrites = self.attributeWrites + 1
+            return self
+        end
+        function canvas:show(fade)
+            assert(not self.deleted, 'show() on a deleted canvas')
+            self.showing = true
+            self.lastShowFade = fade
+            return self
+        end
+        function canvas:hide(fade)
+            assert(not self.deleted, 'hide() on a deleted canvas')
+            self.showing = false
+            self.lastHideFade = fade
+            return self
+        end
+        function canvas:delete(fade)
+            self.deleted = true
+            self.showing = false
+            self.deleteFade = fade
+        end
+        function canvas:isShowing() return self.showing end
+        function canvas:frame(f)
+            if f == nil then return copy(self.frameRect) end
+            self.frameRect = copy(f)
+            return self
+        end
+        function canvas:mouseCallback(fn) self.mouseCallbackFn = fn return self end
+        ctl.canvases[#ctl.canvases + 1] = canvas
+        return canvas
+    end
+    hs.canvas = { new = newCanvas, windowLevels = windowLevels, windowBehaviors = windowBehaviors }
+
+    -- Returns canvases that have not been deleted.
+    function ctl.liveCanvases()
+        local live = {}
+        for _, c in ipairs(ctl.canvases) do
+            if not c.deleted then live[#live + 1] = c end
+        end
+        return live
+    end
+
+    -- Simulates a mouse-down on the element with `id` of a canvas that has a mouse callback.
+    function ctl.click(canvas, id)
+        assert(canvas.mouseCallbackFn, 'canvas has no mouse callback')
+        canvas.mouseCallbackFn(canvas, 'mouseDown', id, 1, 1)
+    end
+
+    -- hs.screen ------------------------------------------------------------------------------
+    local function screenObject(s)
+        return {
+            id = function() return s.id end,
+            fullFrame = function() return copy(s.frame) end,
+            frame = function() return copy(s.visibleFrame or s.frame) end,
+        }
+    end
+    local function watcherFactory(list)
+        return {
+            new = function(fn)
+                local w = { fn = fn, active = false }
+                function w:start() self.active = true return self end
+                function w:stop() self.active = false return self end
+                list[#list + 1] = w
+                return w
+            end,
+        }
+    end
+    hs.screen = {
+        allScreens = function()
+            local list = {}
+            for i, s in ipairs(ctl.screens) do list[i] = screenObject(s) end
+            return list
+        end,
+        watcher = watcherFactory(ctl.screenWatchers),
+    }
+    hs.spaces = { watcher = watcherFactory(ctl.spacesWatchers) }
+
+    -- Calls every active watcher in `list`.
+    local function fire(list, ...)
+        for _, w in ipairs(list) do
+            if w.active then w.fn(...) end
+        end
+    end
+    function ctl.fireSpaceChange() fire(ctl.spacesWatchers, -1) end
+    function ctl.fireScreenChange() fire(ctl.screenWatchers) end
+
+    -- hs.fs ----------------------------------------------------------------------------------
+    hs.fs = {
+        attributes = function(path, attribute)
+            local attrs = ctl.files[path]
+            if not attrs then return nil end
+            if attribute then return attrs[attribute] end
+            return copy(attrs)
+        end,
+        rmdir = function(path)
+            if ctl.files[path] and ctl.files[path].mode == 'directory' then
+                ctl.files[path] = nil
+                return true
+            end
+            return nil, 'No such file or directory'
+        end,
+        temporaryDirectory = function() return ctl.tmpdir end,
+    }
+
+    -- hs.application / hs.image -------------------------------------------------------------
+    hs.application = {
+        applicationForPID = function(pid)
+            ctl.appLookups = ctl.appLookups + 1
+            local app = ctl.apps[pid]
+            if not app then return nil end
+            return {
+                name = function() return app.name end,
+                bundleID = function() return app.bundleID end,
+                path = function() return app.path end,
+                allWindows = function()
+                    local list = {}
+                    for _, id in ipairs(app.windows or {}) do
+                        list[#list + 1] = {
+                            id = function() return id end,
+                            focus = function(self) ctl.focusedWindows[#ctl.focusedWindows + 1] = id return self end,
+                        }
+                    end
+                    return list
+                end,
+            }
+        end,
+    }
+    hs.image = {
+        imageFromAppBundle = function(bundleID)
+            ctl.imageLookups = ctl.imageLookups + 1
+            return { kind = 'image', source = 'bundle:' .. bundleID }
+        end,
+        iconForFile = function(path)
+            ctl.imageLookups = ctl.imageLookups + 1
+            return { kind = 'image', source = 'file:' .. path }
+        end,
+    }
+
+    -- misc ---------------------------------------------------------------------------------
+    hs.json = {
+        decode = function(text)
+            local ok, value = pcall(json.decode, text)
+            if ok then return value end
+            ctl.logs[#ctl.logs + 1] = { level = 'json', msg = value }
+            return nil
+        end,
+        encode = json.encode,
+    }
+    hs.notify = {
+        new = function(_, attributes)
+            return {
+                send = function(self)
+                    ctl.notifications[#ctl.notifications + 1] = attributes
+                    return self
+                end,
+            }
+        end,
+    }
+    hs.inspect = inspect
+    hs.processInfo = { frameworksPath = ctl.frameworksPath, bundlePath = '/Applications/Hammerspoon.app' }
+    hs.configdir = '/Users/tester/.hammerspoon'
+
+    -- Returns log messages at `level` (e.g. 'e', 'w') joined with newlines.
+    function ctl.logText(level)
+        local lines = {}
+        for _, entry in ipairs(ctl.logs) do
+            if not level or entry.level == level then lines[#lines + 1] = entry.msg end
+        end
+        return table.concat(lines, '\n')
+    end
+
+    package.preload['hs.ipc'] = function() ctl.ipcLoaded = true return {} end
+    package.loaded['hs.ipc'] = nil
+
+    _G.hs = hs
+    ctl.hs = hs
+    return ctl
+end
+
+M.inspect = inspect
+return M
