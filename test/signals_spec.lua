@@ -10,7 +10,7 @@ local function find(list, label)
     end
 end
 
--- Runs `script` with /bin/sh and returns its exit status (true on success).
+-- Runs `script` with /bin/sh and returns true on success.
 local function sh(script)
     local ok = os.execute(script)
     return ok == true or ok == 0
@@ -26,26 +26,27 @@ local function read(path)
 end
 
 describe('signals.desired', function()
-    it('forwards window_focused with the window id and never prompts', function()
+    it('forwards window_focused with the window id to stackline\'s port, never prompting', function()
         t.fresh()
         local signals = require 'stackline.signals'
         local focus = find(signals.desired(CLI, '/tmp/T/stackline.pending'), 'stackline_window_focused')
         eq(focus.event, 'window_focused')
-        contains(focus.action, "'" .. CLI .. "' -a -q -t 2 -c")
-        contains(focus.action, "stackline.onSignal('window_focused', '$YABAI_WINDOW_ID')")
+        contains(focus.action, "'" .. CLI .. "' -m stackline -a -q -t 1 -c \"window_focused ${YABAI_WINDOW_ID:-0}\"")
         contains(focus.action, '</dev/null')
-        excludes(focus.action, 'mkdir')
+        contains(focus.action, "/bin/mkdir '/tmp/T/stackline.pending' 2>/dev/null &&")
     end)
 
-    it('collapses refresh signals through the marker directory', function()
+    it('collapses every signal through the marker and never removes it from the shell', function()
         t.fresh()
         local signals = require 'stackline.signals'
         local desired = signals.desired(CLI, '/tmp/T/stackline.pending')
         eq(#desired, #signals.FOCUS_EVENTS + #signals.REFRESH_EVENTS)
-        local moved = find(desired, 'stackline_window_moved')
-        contains(moved.action, "/bin/mkdir '/tmp/T/stackline.pending' 2>/dev/null && {")
-        contains(moved.action, "|| /bin/rmdir '/tmp/T/stackline.pending' 2>/dev/null; }")
-        contains(moved.action, "stackline.onSignal('window_moved')")
+        for _, s in ipairs(desired) do
+            contains(s.action, "/bin/mkdir '/tmp/T/stackline.pending' 2>/dev/null && ")
+            excludes(s.action, 'rmdir')
+            excludes(s.action, 'stackline.onSignal', 'no Lua code is sent to Hammerspoon')
+        end
+        contains(find(desired, 'stackline_window_moved').action, '-c "window_moved"')
     end)
 
     it('produces actions that work in a real shell', function()
@@ -71,22 +72,58 @@ describe('signals.desired', function()
         end
 
         assert(run(focus))
-        contains(read(log), "if stackline then stackline.onSignal('window_focused', '4242') end")
-        contains(read(log), '-a\n-q\n-t\n2\n-c\n')
+        eq(read(log), '-m\nstackline\n-a\n-q\n-t\n1\n-c\nwindow_focused 4242\n')
 
         os.remove(log)
         run(moved)
-        run(moved)
-        local _, calls = read(log):gsub("onSignal%('window_moved'%)", '')
-        eq(calls, 1, 'the second event is swallowed while the marker exists')
-        eq(sh('test -d ' .. q(marker)), true, 'marker left for stackline to clear')
+        run(focus)
+        eq(read(log), '', 'events are swallowed while a refresh is pending')
+        eq(sh('test -d ' .. q(marker)), true)
 
         assert(sh('rmdir ' .. q(marker)))
-        os.remove(log)
         run(moved, 'FAKE_EXIT=1 ')
-        eq(sh('test -d ' .. q(marker)), false, 'a failed delivery removes the marker again')
+        eq(sh('test -d ' .. q(marker)), true, 'a failed delivery leaves the marker for stackline to clear')
+        contains(read(log), 'window_moved')
 
         sh('rm -rf ' .. q(dir))
+    end)
+end)
+
+describe('signals port', function()
+    it('speaks the hs CLI legacy protocol', function()
+        t.fresh()
+        local signals = require 'stackline.signals'
+        local calls = {}
+        local handler = signals.portHandler(function(event, arg) calls[#calls + 1] = { event, arg } end)
+        local reply = handler(nil, 900, '1 + 1')
+        eq(reply, '')
+        t.falsy(reply:find('^version:'), 'anything but "version:" keeps the CLI in legacy mode')
+        handler(nil, 0, 'xwindow_focused 42')
+        handler(nil, 0, 'xwindow_moved')
+        handler(nil, 0, 'x') -- the CLI's empty stdin
+        handler(nil, 0, 'x$(rm -rf /)') -- not an event name: ignored
+        eq(calls, { { 'window_focused', '42' }, { 'window_moved' } })
+    end)
+
+    it('logs handler errors instead of failing the CLI', function()
+        local ctl = t.fresh()
+        local signals = require 'stackline.signals'
+        local handler = signals.portHandler(function() error('boom') end)
+        eq(handler(nil, 0, 'xwindow_moved'), '')
+        contains(ctl.logText('e'), 'boom')
+    end)
+
+    it('opens the stackline port once', function()
+        local ctl = t.fresh()
+        local signals = require 'stackline.signals'
+        local received = {}
+        local port = signals.openPort(function(event, arg) received[#received + 1] = event .. ':' .. tostring(arg) end)
+        t.truthy(port)
+        t.truthy(ctl.cli('stackline', 'window_focused 7'))
+        eq(received, { 'window_focused:7' })
+        eq(signals.openPort(function() end), nil, 'the name is taken while the first port is open')
+        port:delete()
+        t.truthy(signals.openPort(function() end), 'reopened after delete()')
     end)
 end)
 
@@ -132,10 +169,10 @@ describe('signals.sync', function()
         local signals = require 'stackline.signals'
         yabai.setPath('/opt/homebrew/bin/yabai')
         local script
-        ctl.taskHandler = function(path, args)
+        ctl.taskHandler = t.yabai(function(path, args)
             if path == '/bin/sh' then script = args[2] return 0, '', '' end
             return 0, json.encode({ { label = 'stackline_old', event = 'window_moved', action = 'x' } }), ''
-        end
+        end)
         local result
         signals.sync(signals.desired(CLI, '/tmp/m'), function(ok, changed) result = { ok, changed } end)
         ctl.flushTasks()
@@ -146,6 +183,38 @@ describe('signals.sync', function()
         eq(signals.status().registered, #signals.FOCUS_EVENTS + #signals.REFRESH_EVENTS)
     end)
 
+    it('runs signal updates one at a time, in request order', function()
+        local ctl = t.fresh()
+        local json = require 'test.json'
+        local yabai = require 'stackline.yabai'
+        local signals = require 'stackline.signals'
+        yabai.setPath('/opt/homebrew/bin/yabai')
+        local registered, log = {}, {}
+        ctl.taskHandler = t.yabai(function(path, args)
+            if path == '/bin/sh' then
+                -- Apply the script to the fake yabai signal table.
+                for label in args[2]:gmatch("'%-%-remove' '([^']+)'") do registered[label] = nil log[#log + 1] = '-' .. label end
+                for label, event in args[2]:gmatch("'label=([^']+)' 'event=([^']+)'") do
+                    registered[label] = { label = label, event = event, action = '?' }
+                    log[#log + 1] = '+' .. label
+                end
+                return 0, '', ''
+            end
+            local list = {}
+            for _, s in pairs(registered) do list[#list + 1] = s end
+            return 0, json.encode(list), ''
+        end)
+        local desired = { { label = 'stackline_window_moved', event = 'window_moved', action = '?' } }
+        signals.sync(desired)
+        ctl.flushTasks()
+        -- stop() then init(): the removal must finish before the registration starts.
+        signals.removeAll()
+        signals.sync(desired)
+        ctl.flushTasks()
+        eq(log, { '+stackline_window_moved', '-stackline_window_moved', '+stackline_window_moved' })
+        t.truthy(registered.stackline_window_moved, 'signals end up registered')
+    end)
+
     it('removeAll() removes only stackline signals', function()
         local ctl = t.fresh()
         local json = require 'test.json'
@@ -153,13 +222,13 @@ describe('signals.sync', function()
         local signals = require 'stackline.signals'
         yabai.setPath('/opt/homebrew/bin/yabai')
         local script
-        ctl.taskHandler = function(path, args)
+        ctl.taskHandler = t.yabai(function(path, args)
             if path == '/bin/sh' then script = args[2] return 0, '', '' end
             return 0, json.encode({
                 { label = 'stackline_window_moved', event = 'window_moved', action = 'x' },
                 { label = 'mine', event = 'window_moved', action = 'y' },
             }), ''
-        end
+        end)
         signals.removeAll()
         ctl.flushTasks()
         contains(script, "'--remove' 'stackline_window_moved'")
@@ -180,11 +249,13 @@ describe('signals helpers', function()
         eq(signals.resolveCli('/custom/hs'), '/custom/hs')
     end)
 
-    it('keeps the marker in the per-user temporary directory', function()
+    it('keeps the marker in the per-user temporary directory and reports its age', function()
         local ctl = t.fresh()
         local signals = require 'stackline.signals'
         eq(signals.markerPath(), ctl.tmpdir .. 'stackline.pending')
-        ctl.files[signals.markerPath()] = { mode = 'directory' }
+        eq(signals.markerAge(), nil)
+        ctl.files[signals.markerPath()] = { mode = 'directory', change = os.time() - 5 }
+        t.truthy(signals.markerAge() >= 5)
         signals.clearMarker()
         eq(ctl.files[signals.markerPath()], nil)
     end)

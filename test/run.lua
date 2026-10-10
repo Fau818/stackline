@@ -21,7 +21,11 @@ for _, spec in ipairs(SPECS) do
     local file = io.open(root .. '/' .. spec:gsub('%.', '/') .. '.lua')
     if file then
         file:close()
-        require(spec)
+        local ok, err = pcall(require, spec)
+        if not ok then
+            -- Report a spec that fails to load as one failing test instead of aborting the run.
+            helper.registered[#helper.registered + 1] = { name = spec .. ' (load)', fn = function() error(err, 0) end }
+        end
     else
         io.write('SKIP  ', spec, ' (not written yet)\n')
     end
@@ -45,5 +49,6 @@ end
 for _, f in ipairs(failures) do
     io.write('\n[', f.name, ']\n', f.err, '\n')
 end
+require('test.mock_hs').cleanup()
 io.write(('\n%s: %d passed, %d failed (%s)\n'):format(_VERSION, passed, #failures, #failures == 0 and 'ok' or 'FAILED'))
 os.exit(#failures == 0 and 0 or 1)

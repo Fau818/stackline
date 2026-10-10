@@ -4,6 +4,22 @@ local json = require 'test.json'
 
 local M = {}
 
+-- A real directory standing in for hs.fs.temporaryDirectory(): yabai output is captured in files.
+local TMP
+local function tmpdir()
+    if not TMP then
+        TMP = (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. ('stackline-tests-%d/'):format(math.random(1, 1e9))
+        assert(os.execute("mkdir -p '" .. TMP .. "'"), 'cannot create ' .. TMP)
+    end
+    return TMP
+end
+
+-- Removes the temporary directory used by the mocks.
+function M.cleanup()
+    if TMP then os.execute("rm -rf '" .. TMP .. "'") end
+    TMP = nil
+end
+
 -- Returns a shallow copy of `t`.
 local function copy(t)
     local c = {}
@@ -46,7 +62,10 @@ function M.install()
         imageLookups = 0,
         appLookups = 0,
         frameworksPath = '/Applications/Hammerspoon.app/Contents/Frameworks',
-        tmpdir = '/private/var/folders/xy/T/',
+        tmpdir = tmpdir(),
+        ports = {},              -- hs.ipc.localPort name -> port
+        appWatchers = {},
+        frontPid = nil,          -- pid returned by hs.application.frontmostApplication()
     }
 
     local hs = {}
@@ -171,14 +190,21 @@ function M.install()
             frameRect = copy(frame), elements = {}, showing = false, deleted = false,
             levelValue = windowLevels.screenSaver, behaviorValue = 0, subrole = nil,
             clickActivatingValue = true, mouseCallbackFn = nil, attributeWrites = 0,
+            showCount = 0, hideCount = 0, frameWrites = 0, levelWrites = 0, replaceCount = 0,
         }
+        -- Like canvas.lua: an integer level or a name from hs.canvas.windowLevels, nothing else.
         function canvas:level(v)
             if v == nil then return self.levelValue end
-            if type(v) == 'string' then
-                assert(windowLevels[v], 'unrecognized level specified: ' .. v)
-                v = windowLevels[v]
+            if math.type(v) == 'integer' then
+                self.levelValue = v
+            elseif type(v) == 'string' and windowLevels[v] then
+                self.levelValue = windowLevels[v]
+            elseif type(v) == 'string' then
+                error('unrecognized level specified: ' .. v)
+            else
+                error('integer or string expected, got ' .. type(v))
             end
-            self.levelValue = v
+            self.levelWrites = self.levelWrites + 1
             return self
         end
         function canvas:behavior(v)
@@ -195,6 +221,17 @@ function M.install()
             for _, e in ipairs(list) do self.elements[#self.elements + 1] = copy(e) end
             return self
         end
+        -- Like canvas.lua: varargs or one array of elements; extra old elements are removed.
+        function canvas:replaceElements(...)
+            assert(not self.deleted, 'replaceElements() on a deleted canvas')
+            local list = { ... }
+            if select('#', ...) == 1 and #list[1] > 0 then list = list[1] end
+            assert(#list > 0, 'replaceElements called without elements')
+            self.elements = {}
+            for i, e in ipairs(list) do self.elements[i] = copy(e) end
+            self.replaceCount = self.replaceCount + 1
+            return self
+        end
         function canvas:elementAttribute(i, key, value)
             assert(self.elements[i], 'no element at index ' .. tostring(i))
             if value == nil then return self.elements[i][key] end
@@ -206,23 +243,29 @@ function M.install()
             assert(not self.deleted, 'show() on a deleted canvas')
             self.showing = true
             self.lastShowFade = fade
+            self.showCount = self.showCount + 1
             return self
         end
         function canvas:hide(fade)
             assert(not self.deleted, 'hide() on a deleted canvas')
             self.showing = false
             self.lastHideFade = fade
+            self.hideCount = self.hideCount + 1
             return self
         end
+        -- Like Hammerspoon: delete() only hides; the window goes away when Lua collects the canvas.
         function canvas:delete(fade)
             self.deleted = true
             self.showing = false
             self.deleteFade = fade
         end
         function canvas:isShowing() return self.showing end
+        -- Like canvas.lua: frame(rect) sets size then topLeft; elements keep absolute frames.
         function canvas:frame(f)
             if f == nil then return copy(self.frameRect) end
-            self.frameRect = copy(f)
+            assert(not self.deleted, 'frame() on a deleted canvas')
+            self.frameRect = { x = f.x, y = f.y, w = f.w, h = f.h }
+            self.frameWrites = self.frameWrites + 1
             return self
         end
         function canvas:mouseCallback(fn) self.mouseCallbackFn = fn return self end
@@ -241,9 +284,20 @@ function M.install()
     end
 
     -- Simulates a mouse-down on the element with `id` of a canvas that has a mouse callback.
+    -- Like Hammerspoon, hit areas only exist on a canvas that is showing.
     function ctl.click(canvas, id)
         assert(canvas.mouseCallbackFn, 'canvas has no mouse callback')
+        assert(canvas.showing and not canvas.deleted, 'clicks only reach canvases that are showing')
         canvas.mouseCallbackFn(canvas, 'mouseDown', id, 1, 1)
+    end
+
+    -- Returns canvases that are currently showing.
+    function ctl.showingCanvases()
+        local list = {}
+        for _, c in ipairs(ctl.canvases) do
+            if c.showing and not c.deleted then list[#list + 1] = c end
+        end
+        return list
     end
 
     -- hs.screen ------------------------------------------------------------------------------
@@ -303,28 +357,53 @@ function M.install()
     }
 
     -- hs.application / hs.image -------------------------------------------------------------
+    local function appObject(pid, app)
+        return {
+            pid = function() return pid end,
+            name = function() return app.name end,
+            bundleID = function() return app.bundleID end,
+            path = function() return app.path end,
+            allWindows = function()
+                local list = {}
+                for _, id in ipairs(app.windows or {}) do
+                    list[#list + 1] = {
+                        id = function() return id end,
+                        focus = function(self) ctl.focusedWindows[#ctl.focusedWindows + 1] = id return self end,
+                    }
+                end
+                return list
+            end,
+        }
+    end
     hs.application = {
         applicationForPID = function(pid)
             ctl.appLookups = ctl.appLookups + 1
             local app = ctl.apps[pid]
             if not app then return nil end
-            return {
-                name = function() return app.name end,
-                bundleID = function() return app.bundleID end,
-                path = function() return app.path end,
-                allWindows = function()
-                    local list = {}
-                    for _, id in ipairs(app.windows or {}) do
-                        list[#list + 1] = {
-                            id = function() return id end,
-                            focus = function(self) ctl.focusedWindows[#ctl.focusedWindows + 1] = id return self end,
-                        }
-                    end
-                    return list
-                end,
-            }
+            return appObject(pid, app)
         end,
+        frontmostApplication = function()
+            if not ctl.frontPid then return nil end
+            return appObject(ctl.frontPid, ctl.apps[ctl.frontPid] or { name = 'front' })
+        end,
+        watcher = {
+            launching = 0, launched = 1, terminated = 2, hidden = 3, unhidden = 4, activated = 5, deactivated = 6,
+            new = function(fn)
+                local w = { fn = fn, active = false }
+                function w:start() self.active = true return self end
+                function w:stop() self.active = false return self end
+                ctl.appWatchers[#ctl.appWatchers + 1] = w
+                return w
+            end,
+        },
     }
+
+    -- Calls active application watchers with (name, event, app).
+    function ctl.fireAppEvent(name, event, pid)
+        for _, w in ipairs(ctl.appWatchers) do
+            if w.active then w.fn(name, event, pid and appObject(pid, ctl.apps[pid] or {}) or nil) end
+        end
+    end
     hs.image = {
         imageFromAppBundle = function(bundleID)
             ctl.imageLookups = ctl.imageLookups + 1
@@ -369,8 +448,37 @@ function M.install()
         return table.concat(lines, '\n')
     end
 
-    package.preload['hs.ipc'] = function() ctl.ipcLoaded = true return {} end
+    -- hs.ipc: only localPort is used; ctl.send() plays the role of the `hs` CLI talking to a port.
+    package.preload['hs.ipc'] = function()
+        ctl.ipcLoaded = true
+        return {
+            localPort = function(name, fn)
+                assert(not (ctl.ports[name] and ctl.ports[name].valid), 'port name already in use: ' .. name)
+                local port = { portName = name, fn = fn, valid = true }
+                function port:delete() self.valid = false end
+                function port:isValid() return self.valid end
+                function port:name() return self.portName end
+                ctl.ports[name] = port
+                return port
+            end,
+        }
+    end
     package.loaded['hs.ipc'] = nil
+
+    -- Sends `data` with `msgID` to the local port `name`; returns the reply (nil if the port is gone).
+    function ctl.send(name, msgID, data)
+        local port = ctl.ports[name]
+        if not port or not port.valid then return nil end
+        return tostring(port.fn(port, msgID, data))
+    end
+
+    -- Simulates `hs -m <name> -c <command>` in legacy mode, as the stackline signal actions run it.
+    function ctl.cli(name, command)
+        if ctl.send(name, 900, '1 + 1') == nil then return false end
+        ctl.send(name, 0, 'x' .. command)
+        ctl.send(name, 0, 'x') -- the CLI also sends its (empty) stdin
+        return true
+    end
 
     _G.hs = hs
     ctl.hs = hs

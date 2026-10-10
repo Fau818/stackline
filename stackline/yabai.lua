@@ -6,12 +6,19 @@ local util = require 'stackline.util'
 local yabai = {}
 
 -- Only what stackline needs: fewer properties means less work for yabai and smaller JSON for us.
-yabai.WINDOW_PROPERTIES = 'id,pid,app,space,frame,stack-index,has-focus,is-visible'
+yabai.WINDOW_PROPERTIES = 'id,pid,app,space,frame,stack-index,has-focus,is-visible,has-parent-zoom,has-fullscreen-zoom'
+
+-- hs.task reads a pipe only after the process exits, so output larger than the pipe buffer
+-- (a few hundred windows) would block yabai forever. Commands therefore write stdout to a file:
+--   /bin/sh -c '<CAPTURE_SCRIPT>' stackline-yabai <file> <yabai> <args...>
+local CAPTURE_SCRIPT = 'out=$1; shift; exec "$@" >"$out"'
+local CAPTURE_TAG = 'stackline-yabai'
 
 local state = {
     path = nil,          -- resolved binary
-    version = nil,       -- { major, minor, patch } once probed
-    selectProps = true,  -- `query --windows <props>` needs yabai >= 7.0.3
+    version = nil,       -- { major, minor, patch } once probed (informational)
+    selectProps = true,  -- `query --windows <props>` needs yabai >= 7.0.3; cleared when yabai rejects it
+    captures = 0,        -- counter for unique capture file names
 }
 
 -- Returns the attribute `mode` of `path` ('file', 'directory', ...) or nil when it does not exist.
@@ -100,6 +107,26 @@ function yabai.supportsPropertySelection(version)
     return a > 7 or (a == 7 and (b > 0 or c >= 3))
 end
 
+-- Returns a fresh path for capturing one command's stdout.
+local function captureFile()
+    state.captures = state.captures + 1
+    local dir = (hs.fs.temporaryDirectory and hs.fs.temporaryDirectory()) or '/tmp/'
+    if dir:sub(-1) ~= '/' then dir = dir .. '/' end
+    return dir .. ('stackline-%d.out'):format(state.captures)
+end
+
+-- Returns the content of file `path` ('' when it does not exist) and deletes the file.
+local function slurp(path)
+    local content = ''
+    local f = io.open(path, 'rb')
+    if f then
+        content = f:read('a') or ''
+        f:close()
+    end
+    os.remove(path)
+    return content
+end
+
 -- Runs `<yabai> <args...>` asynchronously and calls `cb(ok, stdout, stderr, exitCode)` exactly once.
 -- `timeout` (seconds, default 3) terminates a hung process. Returns the hs.task, or nil.
 function yabai.exec(args, cb, timeout)
@@ -108,10 +135,41 @@ function yabai.exec(args, cb, timeout)
         cb(false, '', 'yabai binary not found', -1)
         return nil
     end
-    return yabai.spawn(state.path, args, cb, timeout)
+
+    local out = captureFile()
+    local argv = { '-c', CAPTURE_SCRIPT, CAPTURE_TAG, out, state.path }
+    for _, arg in ipairs(args) do argv[#argv + 1] = arg end
+
+    local finished, timer = false, nil
+    local function finish(ok, stdout, err, code)
+        finished = true
+        if timer then timer:stop() end
+        cb(ok, stdout, err or '', code)
+    end
+
+    local task = hs.task.new('/bin/sh', function(code, _, err)
+        -- A late callback after a timeout only cleans up whatever the killed process left behind.
+        if finished then return os.remove(out) end
+        finish(code == 0, slurp(out), err, code)
+    end, argv)
+    if not task or not task:start() then
+        os.remove(out)
+        finish(false, '', 'could not launch ' .. state.path, -1)
+        return nil
+    end
+
+    timer = hs.timer.doAfter(timeout or 3, function()
+        if finished then return end
+        -- Report first: terminating fires the task callback, which must not win with an empty error.
+        finish(false, '', ('timed out: %s %s'):format(state.path, table.concat(args, ' ')), -1)
+        os.remove(out)
+        if task:isRunning() then task:terminate() end
+    end)
+    return task
 end
 
--- Runs `path` with `args` like yabai.exec (also used for /bin/sh scripts). Returns the hs.task, or nil.
+-- Runs `path` with `args` and calls `cb(ok, stdout, stderr, exitCode)` exactly once, reading stdout
+-- from a pipe: only for commands with little output, such as /bin/sh scripts. Returns the hs.task, or nil.
 function yabai.spawn(path, args, cb, timeout)
     local finished, timer = false, nil
     local function finish(ok, out, err, code)
@@ -142,18 +200,19 @@ end
 function yabai.decode(text)
     if type(text) ~= 'string' or not text:find('%S') then return nil, 'empty output from yabai' end
     -- yabai prints frames with printf("%.4f"), which yields bare inf/nan for degenerate windows:
-    -- not valid JSON, so replace those numbers with 0 before decoding.
-    local clean = text:gsub('([:%[,]%s*)%-?inf', '%10'):gsub('([:%[,]%s*)%-?nan', '%10')
+    -- not valid JSON, so turn those numbers into null (nil in Lua) before decoding.
+    local clean = text:gsub('([:%[,]%s*)%-?inf', '%1null'):gsub('([:%[,]%s*)%-?nan', '%1null')
     local ok, value = pcall(hs.json.decode, clean)
     if not ok or value == nil then return nil, 'could not parse yabai output as JSON' end
     return value
 end
 
 -- Reads the yabai version (once per yabai start) and calls `cb(version)`; version may be nil.
+-- The version is informational only: `yabai --version` reports the binary, and after an upgrade
+-- the running daemon may be older, so queryWindows learns what the daemon accepts from its errors.
 function yabai.probe(cb)
     yabai.exec({ '--version' }, function(ok, out)
         state.version = ok and yabai.parseVersion(out) or nil
-        state.selectProps = yabai.supportsPropertySelection(state.version)
         if not state.version then log.w('could not determine the yabai version') end
         if cb then cb(state.version) end
     end)

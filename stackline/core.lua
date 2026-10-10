@@ -12,7 +12,10 @@ local Scheduler = require 'stackline.scheduler'
 local signals   = require 'stackline.signals'
 local yabai     = require 'stackline.yabai'
 
-local HEALTH_INTERVAL = 5 -- seconds between checks that yabai is (still) running
+local HEALTH_INTERVAL = 5     -- seconds between checks that yabai is (still) running
+local RETRY_DELAY = 0.12      -- seconds to wait before re-querying a half-updated yabai snapshot
+local MAX_RETRIES = 3
+local STALE_MARKER_AGE = 2    -- seconds after which a leftover signal marker is cleared
 
 local stackline = { version = '0.2.0' }
 stackline.config = Config.new(defaults)
@@ -40,6 +43,21 @@ end
 local function args(first, ...)
     if first == stackline then return ... end
     return first, ...
+end
+
+-- Returns `fn` wrapped so errors are logged instead of escaping into Hammerspoon (an error in a
+-- repeating hs.timer callback would stop that timer for good).
+local function guarded(name, fn)
+    return function(...)
+        local ok, err = xpcall(fn, debug.traceback, ...)
+        if not ok then log.e(name .. ' failed: ' .. tostring(err)) end
+    end
+end
+
+-- Returns the pid of the frontmost application, or nil.
+local function frontPid()
+    local app = hs.application.frontmostApplication and hs.application.frontmostApplication()
+    return app and app:pid() or nil
 end
 
 -- Returns every screen as { id, frame } using absolute full-frame coordinates.
@@ -96,12 +114,28 @@ local function refresh(done)
             local cfg = stackline.config:all()
             local fuzzy = cfg.features.fzyFrameDetect
             state.yabaiUp, state.lastError = true, nil
-            state.stacks = model.build(windows, {
+            local stacks, info = model.build(windows, {
                 tolerance = fuzzy.enabled and fuzzy.fuzzFactor or 0,
                 screens = screens(),
+                -- yabai keeps reporting the last window it saw focused when focus moves to an app
+                -- it does not track (e.g. Raycast); only trust it for the frontmost app.
+                frontPid = frontPid(),
             })
-            render.apply(state.stacks, cfg, onClick)
-            state.lastRefresh = { duration = now() - started, windows = #windows, stacks = #state.stacks }
+
+            -- yabai updates window frames as AX events arrive, so a query can catch a layout
+            -- half-way through a change. Keep what is drawn and look again shortly, a few times.
+            if info and info.inconsistent > 0 and state.retries < MAX_RETRIES then
+                state.retries = state.retries + 1
+                hs.timer.doAfter(RETRY_DELAY, guarded('retry', function()
+                    if state.initialized then state.scheduler:request() end
+                end))
+                return
+            end
+            if not (info and info.inconsistent > 0) then state.retries = 0 end
+
+            state.stacks = stacks
+            render.apply(stacks, cfg, onClick)
+            state.lastRefresh = { duration = now() - started, windows = #windows, stacks = #stacks }
         end, debug.traceback)
         if not ok then log.e('refresh failed: ' .. tostring(problem)) end
         done()
@@ -151,6 +185,13 @@ local function checkYabai()
         yabai.setPath(path)
     end
 
+    -- A signal marker that outlived its refresh means a delivery was lost; recover from it.
+    local age = signals.markerAge()
+    if age and age >= STALE_MARKER_AGE and not state.scheduler:busy() then
+        signals.clearMarker()
+        state.scheduler:request()
+    end
+
     -- A restarted yabai recreates its socket, so a new inode means "re-register signals".
     local socket = hs.fs.attributes(yabai.socketPath())
     if not socket then
@@ -164,6 +205,8 @@ local function checkYabai()
         yabaiStarted()
     end
 end
+
+local startPolling -- defined below; watchConfig() restarts it when advanced.pollInterval changes
 
 -- Wires configuration changes to the parts of stackline they affect.
 local function watchConfig()
@@ -184,6 +227,20 @@ local function watchConfig()
         state.socketId = nil
         checkYabai()
     end)
+    config:onChange('advanced.pollInterval', function() startPolling() end)
+end
+
+-- (Re)starts the optional safety-net poll (advanced.pollInterval seconds; 0 disables it). It only
+-- queries while stacks exist, to catch changes yabai reports no event for.
+startPolling = function()
+    if state.poll then state.poll:stop() end
+    state.poll = nil
+    local interval = stackline.config:get('advanced.pollInterval')
+    if interval and interval > 0 then
+        state.poll = hs.timer.doEvery(interval, guarded('poll', function()
+            if #state.stacks > 0 then state.scheduler:request() end
+        end))
+    end
 end
 
 -- Public API -----------------------------------------------------------------------------
@@ -203,11 +260,7 @@ function stackline.init(...)
         notifyOnce('config', 'Invalid stackline config', table.concat(problems, '\n'))
     end
 
-    -- The `hs` CLI used by yabai signals talks to Hammerspoon through hs.ipc.
-    local ipcOk = pcall(require, 'hs.ipc')
-    if not ipcOk then log.w('hs.ipc could not be loaded; yabai signals cannot reach stackline') end
-
-    state = { initialized = true, stacks = {}, startedAt = started }
+    state = { initialized = true, stacks = {}, startedAt = started, retries = 0 }
     state.scheduler = Scheduler.new({
         interval = function() return stackline.config:get('advanced.maxRefreshRate') end,
         run = refresh,
@@ -215,12 +268,29 @@ function stackline.init(...)
     signals.clearMarker()
     watchConfig()
 
-    -- In-process watchers are cheap and react without waiting for yabai's signals.
-    local function request() state.scheduler:request() end
+    -- yabai signals reach stackline through its own message port (see stackline/signals.lua).
+    state.port = signals.openPort(function(event, arg) stackline.onSignal(event, arg) end)
+
+    -- In-process watchers are cheap (no Accessibility queries) and also cover what yabai may not
+    -- report, e.g. focus moving to an app yabai does not track.
+    local request = guarded('watcher', function() state.scheduler:request() end)
     state.watchers = {}
-    if hs.spaces and hs.spaces.watcher then state.watchers[#state.watchers + 1] = hs.spaces.watcher.new(request):start() end
-    if hs.screen and hs.screen.watcher then state.watchers[#state.watchers + 1] = hs.screen.watcher.new(request):start() end
-    state.health = hs.timer.doEvery(HEALTH_INTERVAL, checkYabai)
+    local function watch(w) state.watchers[#state.watchers + 1] = w:start() end
+    if hs.spaces and hs.spaces.watcher then watch(hs.spaces.watcher.new(request)) end
+    if hs.screen and hs.screen.watcher then watch(hs.screen.watcher.new(request)) end
+    if hs.application and hs.application.watcher then
+        local app = hs.application.watcher
+        local relevant = {
+            [app.activated] = true, [app.launched] = true, [app.terminated] = true,
+            [app.hidden] = true, [app.unhidden] = true,
+        }
+        watch(app.new(guarded('application watcher', function(_, event)
+            if relevant[event] then state.scheduler:request() end
+        end)))
+    end
+
+    state.health = hs.timer.doEvery(HEALTH_INTERVAL, guarded('yabai check', checkYabai))
+    startPolling()
     checkYabai()
 
     state.initDuration = now() - started
@@ -242,9 +312,13 @@ function stackline.onSignal(...)
     local event, windowId = args(...)
     if not state.initialized then return end
     if event == 'window_focused' then
-        -- Move the highlight right away; the refresh below confirms it.
-        local id = tonumber(windowId)
-        if id and #model.applyFocus(state.stacks, id) > 0 then render.restyle(stackline.config:all()) end
+        -- Move the highlight right away; the refresh below confirms it. A failure here must not
+        -- prevent that refresh, or the pending-signal marker would never be cleared.
+        local ok, err = pcall(function()
+            local id = math.tointeger(tonumber(windowId))
+            if id and id > 0 and #model.applyFocus(state.stacks, id) > 0 then render.restyle(stackline.config:all()) end
+        end)
+        if not ok then log.e('focus update failed: ' .. tostring(err)) end
     end
     state.scheduler:request()
 end
@@ -255,6 +329,8 @@ function stackline.stop()
     state.initialized = false
     state.scheduler:stop()
     state.health:stop()
+    if state.poll then state.poll:stop() end
+    if state.port then state.port:delete() end
     for _, watcher in ipairs(state.watchers) do watcher:stop() end
     render.clear(0)
     stackline.config:clearListeners()

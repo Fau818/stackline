@@ -28,6 +28,28 @@ function helper.fresh()
     return mock.install()
 end
 
+-- yabai.exec captures stdout in a file (hs.task only drains pipes after exit) by running
+--   /bin/sh -c 'out=$1; shift; exec "$@" >"$out"' stackline-yabai <outFile> <yabai> <args...>
+helper.CAPTURE_TAG = 'stackline-yabai'
+
+-- Returns an hs.task handler for the mock that calls `handler(path, args, task)` with the real
+-- yabai invocation for captured commands (writing its stdout to the capture file), and passes
+-- every other task (e.g. /bin/sh scripts) through unchanged. `handler` returning nil means "hang".
+function helper.yabai(handler)
+    return function(path, args, task)
+        if path == '/bin/sh' and args[1] == '-c' and args[3] == helper.CAPTURE_TAG then
+            local out, bin = args[4], args[5]
+            local code, stdout, stderr = handler(bin, { table.unpack(args, 6) }, task)
+            if code == nil then return nil end
+            local f = assert(io.open(out, 'wb'))
+            f:write(stdout or '')
+            f:close()
+            return code, '', stderr
+        end
+        return handler(path, args, task)
+    end
+end
+
 -- Returns true when `a` and `b` are deeply equal.
 local function deepEqual(a, b)
     if a == b then return true end

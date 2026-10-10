@@ -146,6 +146,7 @@ local SCHEMA = {
     },
     advanced = {
         maxRefreshRate = 'nonnegative',
+        pollInterval   = 'nonnegative',
     },
 }
 

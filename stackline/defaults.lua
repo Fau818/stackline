@@ -44,5 +44,6 @@ return {
 
     advanced = {
         maxRefreshRate = 0.1,            -- Minimum seconds between refreshes. Higher = slower response + less work during bursts
+        pollInterval   = 0,              -- Seconds between safety-net refreshes while stacks exist; 0 = off (rely on events)
     },
 }

@@ -8,11 +8,13 @@ local signals = {}
 
 signals.PREFIX = 'stackline_'
 
--- Passes the focused window id so the highlight can move before the follow-up query returns.
+-- Hammerspoon message port the signal actions talk to (see signals.openPort).
+signals.PORT = 'stackline'
+
+-- Pass the focused window id so the highlight can move before the follow-up query returns.
 signals.FOCUS_EVENTS = { 'window_focused' }
 
--- Only need a refresh. Bursts (e.g. resizing) are collapsed: an event is forwarded only while no
--- refresh is pending, which a marker directory tracks without any extra processes.
+-- Only need a refresh.
 signals.REFRESH_EVENTS = {
     'application_front_switched', -- focus moved to an app whose window yabai may not track
     'application_hidden', 'application_visible',
@@ -37,6 +39,13 @@ function signals.clearMarker()
     hs.fs.rmdir(signals.markerPath())
 end
 
+-- Returns how many seconds ago the marker was created, or nil when there is none.
+function signals.markerAge()
+    local created = hs.fs.attributes(signals.markerPath(), 'change')
+    if not created then return nil end
+    return os.time() - created
+end
+
 -- Returns the `hs` CLI to call from signal actions, or nil when none exists.
 -- The CLI bundled inside Hammerspoon.app works without running hs.ipc.cliInstall().
 function signals.resolveCli(configured)
@@ -53,32 +62,68 @@ function signals.resolveCli(configured)
     return nil
 end
 
--- Returns the shell command that runs Lua `code` in Hammerspoon through the `hs` CLI at `cli`.
-local function hsCommand(cli, code)
-    -- -a: exit quietly instead of prompting "Hammerspoon is not running, launch it?"
-    -- -q, -t 2: no console echo; give up after 2 s if Hammerspoon is busy.
-    -- </dev/null: the CLI reads stdin when it is not a TTY; never let it wait on yabai's stdin.
-    return ('%s -a -q -t 2 -c "%s" </dev/null >/dev/null 2>&1'):format(util.shellQuote(cli), code)
+-- Returns the action yabai runs for `message`: forward it to stackline's port unless a refresh
+-- is already pending.
+local function action(cli, marker, message)
+    -- Bursts (e.g. resizing) collapse into one delivery: mkdir is atomic and fails while the marker
+    -- exists, and stackline removes the marker when the refresh starts (so later events get
+    -- through again). A failed delivery leaves the marker in place, which keeps a stopped or
+    -- reloading Hammerspoon from being hammered; stackline clears stale markers itself.
+    --
+    -- hs flags: -m talks to stackline's own port (a reply-only handler, so the CLI skips Lua
+    -- evaluation and print forwarding); -a exits quietly instead of prompting to launch
+    -- Hammerspoon; -t 1 bounds the wait while Hammerspoon is busy; </dev/null because the CLI
+    -- reads stdin when it is not a TTY.
+    return ('/bin/mkdir %s 2>/dev/null && %s -m %s -a -q -t 1 -c "%s" </dev/null >/dev/null 2>&1')
+        :format(util.shellQuote(marker), util.shellQuote(cli), signals.PORT, message)
 end
 
 -- Returns the signals stackline should have registered: a list of { label, event, action }.
 function signals.desired(cli, marker)
     local list = {}
     for _, event in ipairs(signals.FOCUS_EVENTS) do
-        local code = ("if stackline then stackline.onSignal('%s', '$YABAI_WINDOW_ID') end"):format(event)
-        list[#list + 1] = { label = signals.PREFIX .. event, event = event, action = hsCommand(cli, code) }
+        list[#list + 1] = {
+            label = signals.PREFIX .. event, event = event,
+            action = action(cli, marker, event .. ' ${YABAI_WINDOW_ID:-0}'),
+        }
     end
-
-    local m = util.shellQuote(marker)
     for _, event in ipairs(signals.REFRESH_EVENTS) do
-        local code = ("if stackline then stackline.onSignal('%s') end"):format(event)
-        -- mkdir is atomic: only the first event of a burst gets through; stackline removes the
-        -- marker when the refresh starts, and the action removes it again if delivery failed.
-        local action = ('/bin/mkdir %s 2>/dev/null && { %s || /bin/rmdir %s 2>/dev/null; }')
-            :format(m, hsCommand(cli, code), m)
-        list[#list + 1] = { label = signals.PREFIX .. event, event = event, action = action }
+        list[#list + 1] = { label = signals.PREFIX .. event, event = event, action = action(cli, marker, event) }
     end
     return list
+end
+
+-- Returns the hs.ipc.localPort callback that turns `hs -m stackline -c "<event> [arg]"` messages
+-- into `onEvent(event, arg)` calls.
+function signals.portHandler(onEvent)
+    return function(_, msgID, data)
+        -- The CLI first probes the port (msgID 900); any reply that does not start with "version:"
+        -- puts it in legacy mode, where each command arrives as msgID 0 with a one-byte prefix.
+        if msgID == 0 and type(data) == 'string' and #data > 1 then
+            local event, arg = data:sub(2):match('^%s*([%w_]+)%s*(%S*)')
+            if event then
+                local ok, err = pcall(onEvent, event, arg ~= '' and arg or nil)
+                if not ok then log.e(('handling yabai signal %s failed: %s'):format(event, tostring(err))) end
+            end
+        end
+        return ''
+    end
+end
+
+-- Opens stackline's message port, calling `onEvent(event, arg)` for each forwarded signal.
+-- Returns the hs.ipc port (delete() it when stopping), or nil when it could not be opened.
+function signals.openPort(onEvent)
+    local ok, ipc = pcall(require, 'hs.ipc')
+    if not ok or not ipc or not ipc.localPort then
+        log.e('hs.ipc is unavailable; yabai signals cannot reach stackline')
+        return nil
+    end
+    local opened, port = pcall(ipc.localPort, signals.PORT, signals.portHandler(onEvent))
+    if not opened or not port then
+        log.e('could not open the "' .. signals.PORT .. '" message port: ' .. tostring(port))
+        return nil
+    end
+    return port
 end
 
 -- Returns the yabai argument lists needed to turn `current` (from `signal --list`) into `desired`.
@@ -123,28 +168,48 @@ local function runAll(commands, cb)
     end, 15)
 end
 
--- Makes yabai's stackline signals match `desired`; calls `cb(ok, changedCount)`.
-function signals.sync(desired, cb)
+-- Signal updates run one at a time, in request order, so e.g. stop() followed by init() cannot
+-- end with the (older) removal finishing after the (newer) registration.
+local queue, busy = {}, false
+
+-- Starts the next queued sync when none is running.
+local function pump()
+    if busy or #queue == 0 then return end
+    busy = true
+    local job = table.remove(queue, 1)
+    local function finish(ok, changed)
+        busy = false
+        if job.cb then
+            local cbOk, err = pcall(job.cb, ok, changed)
+            if not cbOk then log.e('signal sync callback failed: ' .. tostring(err)) end
+        end
+        pump()
+    end
+
     yabai.listSignals(function(current, err)
         if not current then
             log.w('could not list yabai signals: ' .. tostring(err))
-            if cb then cb(false, 0) end
-            return
+            return finish(false, 0)
         end
-        local commands = signals.plan(current, desired)
-        state.expected = #desired
+        local commands = signals.plan(current, job.desired)
+        state.expected = #job.desired
         if #commands == 0 then
-            state.registered, state.lastSync = #desired, hs.timer.secondsSinceEpoch()
-            if cb then cb(true, 0) end
-            return
+            state.registered, state.lastSync = #job.desired, hs.timer.secondsSinceEpoch()
+            return finish(true, 0)
         end
         log.i(('updating %d yabai signal(s)'):format(#commands))
         runAll(commands, function(ok)
-            state.registered = ok and #desired or 0
+            state.registered = ok and #job.desired or 0
             state.lastSync = hs.timer.secondsSinceEpoch()
-            if cb then cb(ok, #commands) end
+            finish(ok, #commands)
         end)
     end)
+end
+
+-- Makes yabai's stackline signals match `desired`; calls `cb(ok, changedCount)`.
+function signals.sync(desired, cb)
+    queue[#queue + 1] = { desired = desired, cb = cb }
+    pump()
 end
 
 -- Removes every stackline signal from yabai; calls `cb(ok)`.
