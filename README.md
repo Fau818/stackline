@@ -38,12 +38,14 @@ The original project has been unmaintained since 2021. Version 0.2 is a rewrite 
   nothing changes.
 - 🎯 **yabai is the source of truth.** Stack membership, order (`stack-index`), focus and frames come straight from
   yabai, so swaps, inserts and re-orders are always reflected. No more frame-guessing crashes.
-- 📡 **Event driven.** stackline registers its own yabai signals (labels `stackline_*`) and re-registers them after
-  yabai restarts. Nothing to add to your `yabairc`.
-- 🖼️ **One small canvas per stack** instead of a full-screen canvas per window. Focus changes only recolor
-  indicators; a stack is rebuilt only when its layout changes. App icons are cached.
+- 📡 **Event driven.** stackline registers its own yabai signals (labels `stackline_*`), which talk to a dedicated
+  Hammerspoon message port, and re-registers them after yabai restarts. Nothing to add to your `yabairc`.
+- 🖼️ **One small canvas per stack** instead of a full-screen canvas per window. Canvases are reused, focus changes
+  only recolor indicators, and app icons are cached.
 - 🖥️ **Multi-display click-to-focus** without coordinate conversions, and indicators no longer draw over menus.
   yabai ignores the indicator windows, so `yabai -m display --focus` no longer focuses Hammerspoon.
+- 🔍 **Stays out of the way.** Indicators of a stack covered by a zoomed or maximized window are hidden, and focus
+  in apps yabai does not track (Raycast, Alfred, …) no longer leaves a stack highlighted.
 - 🧩 **Same configuration** keys as before, now deep-merged with the defaults, validated (with "did you mean…?"
   hints), and accepting hex colors such as `'#e6e6e6'` or yabai-style `'0xffe6e6e6'`.
 
@@ -52,6 +54,11 @@ The original project has been unmaintained since 2021. Version 0.2 is a rewrite 
 - [yabai](https://github.com/koekeishiya/yabai) **7.0.3 or newer** recommended (tested with 7.1.25); 4.x–6.x work with
   a slightly larger query. The scripting addition is not required.
 - [Hammerspoon](https://www.hammerspoon.org) **1.0 or newer** (tested with 1.1.1) with Accessibility permission.
+
+> **macOS 27:** yabai 7.1.25 (and its `master` as of June 2026) only recognizes macOS versions up to 26, so on
+> macOS 27 a few of its event sources stay off (e.g. Mission Control signals, a fallback for detecting closed
+> windows). stackline does not depend on them: Hammerspoon's own app, Space and screen watchers also trigger
+> refreshes, and `advanced.pollInterval` can add a periodic safety net.
 
 ## Installation
 
@@ -149,6 +156,7 @@ hs -c "print(stackline.config:get('appearance.size'))"
 | `features.fzyFrameDetect.enabled` | `true` | Treat stacked windows whose top-left corners nearly match as one stack |
 | `features.fzyFrameDetect.fuzzFactor` | `30` | Max distance (px) between corners of windows in one stack |
 | `advanced.maxRefreshRate` | `0.1` | Minimum seconds between refreshes during bursts of events |
+| `advanced.pollInterval` | `0` | Seconds between safety-net refreshes while stacks exist; `0` relies on events only |
 
 `features.hsBugWorkaround`, `features.winTitles` and `features.dynamicLuminosity` are still accepted but have no effect.
 
@@ -158,22 +166,27 @@ more padding, e.g. `yabai -m config left_padding 40 right_padding 40`.
 ## How it works
 
 ```
-yabai event ──► yabai signal (stackline_*) ──► hs CLI ──► stackline.onSignal()
-Space / screen change (Hammerspoon watchers) ─────────────────┘        │
-                                                   throttled refresh ◄──┘
-                                                          │
-          yabai -m query --windows id,pid,app,space,frame,stack-index,has-focus,is-visible
-                                                          │
-                       group windows into stacks ─► diff with what is drawn ─► update canvases
+yabai event ─► signal stackline_* ─► hs -m stackline ─► "stackline" port ─┐
+app / Space / screen change (Hammerspoon watchers) ───────────────────────┤
+                                                          throttled refresh
+                                                                  │
+   yabai -m query --windows id,pid,app,space,frame,stack-index,has-focus,is-visible,has-parent-zoom,has-fullscreen-zoom
+                                                                  │
+               group windows into stacks ─► diff with what is drawn ─► update canvases in place
 ```
 
-- Bursts of events (e.g. while resizing) are collapsed: at most one Hammerspoon call per refresh.
-- `window_focused` carries the window id, so the highlight moves before the follow-up query returns.
-- Every 5 seconds stackline checks yabai's socket; when yabai restarts it registers its signals again, and when yabai
+- Bursts of events (e.g. while resizing) are collapsed: a signal is forwarded only while no refresh is pending, so
+  there is at most one `hs` call per refresh. `window_focused` carries the window id, so the highlight moves before
+  the follow-up query returns.
+- The signal actions talk to stackline's own message port, so Hammerspoon never evaluates Lua sent over IPC, and
+  `-a` keeps the CLI quiet instead of offering to launch Hammerspoon when it is not running.
+- Every 5 seconds stackline checks yabai's socket: when yabai restarts it registers its signals again, and when yabai
   stops the indicators are hidden.
+- If a query catches yabai half-way through a re-layout, stackline keeps what is drawn and looks again shortly.
+- Canvases stay on the Space they were drawn on, so switching back to a Space shows its indicators immediately.
 - yabai emits no event for a few actions: `space --layout float`, toggling float without moving the window, or
   swapping two *unfocused* stacked windows. Indicators catch up on the next event; to update them immediately, add
-  `hs -c 'stackline.refresh()'` to those key bindings.
+  `hs -c 'stackline.refresh()'` to those key bindings, or set `advanced.pollInterval`.
 
 ## API
 
@@ -193,8 +206,10 @@ Space / screen change (Hammerspoon watchers) ───────────�
 - **Nothing shows up:** run `hs -c 'stackline.status()'`. If yabai isn't found, set `paths.yabai`. Then
   `hs -c "stackline:setLogLevel('info')"` and watch the Hammerspoon console while creating a stack.
 - **Indicators do not update:** list the signals with
-  `yabai -m signal --list | jq '[.[] | select(.label | startswith("stackline_"))] | length'`. If it prints `0`,
-  run `hs -c 'stackline:refresh()'` or reload Hammerspoon.
+  `yabai -m signal --list | jq '[.[] | select(.label | startswith("stackline_"))] | length'`. It should print `19`;
+  if it prints `0`, run `hs -c 'stackline:refresh()'` or reload Hammerspoon.
+- **All indicators vanished at once:** hiding Hammerspoon (⌘H while it is frontmost) hides its windows, indicators
+  included. Click Hammerspoon's menu bar icon or reload it.
 - **Old signal snippets:** lines in your `yabairc` that call `stackline.manager:update(...)` or `stackline:refresh()`
   still work but are no longer needed.
 

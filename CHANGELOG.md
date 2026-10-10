@@ -5,12 +5,17 @@
 Rewrite for yabai 7.x and Hammerspoon 1.x (Apple Silicon and Intel).
 
 ### Changed
-- yabai is the single source of truth: one `yabai -m query --windows <properties>` per refresh (full query on
-  yabai < 7.0.3) replaces frame grouping through `hs.window.filter`, which was the main cause of slow startup.
+- yabai is the single source of truth: one `yabai -m query --windows <properties>` per refresh replaces frame
+  grouping through `hs.window.filter`, which was the main cause of slow startup. Older yabai versions that reject
+  the property list get a full query instead (detected from yabai's answer, not from `yabai --version`, since the
+  running daemon may be older than the installed binary).
 - Refreshes are driven by yabai signals that stackline registers itself (`stackline_*` labels) and re-registers
-  after yabai restarts, plus Space and screen watchers. Bursts of events collapse into one refresh.
-- One canvas per stack (plus a click target) instead of one full-screen canvas per window; focus changes recolor
-  indicators in place and only stacks whose layout changed are rebuilt. App icons are cached per application.
+  after yabai restarts. The signals talk to a dedicated Hammerspoon message port (`hs -m stackline`), so no Lua is
+  evaluated over IPC; bursts of events collapse into one refresh. Application, Space and screen watchers add
+  triggers that do not depend on yabai.
+- One canvas per stack (plus a click target) instead of one full-screen canvas per window. Canvases are reused and
+  pooled, focus changes recolor indicators in place, and app icons are cached per application.
+- Canvases stay on the Space they were drawn on instead of being redrawn on every Space switch.
 - Indicators use the `floating` window level (configurable via `appearance.windowLevel`), so menus and Spotlight
   draw above them.
 - `advanced.maxRefreshRate` now defaults to `0.1` seconds.
@@ -18,9 +23,10 @@ Rewrite for yabai 7.x and Hammerspoon 1.x (Apple Silicon and Intel).
 
 ### Added
 - `stackline:stop()`, `stackline.status()`, `stackline:refresh(force)`; `.` and `:` call styles both work.
-- `paths.hs`, `features.yabaiSignals`, `appearance.windowLevel` options.
+- `paths.hs`, `features.yabaiSignals`, `appearance.windowLevel` and `advanced.pollInterval` options.
 - Automatic yabai path detection (Homebrew on Apple Silicon/Intel, Homebrew prefixes, Nix); config validation with
   suggestions; hex colors.
+- Indicators of a stack covered by a zoomed or maximized window are hidden (#11).
 - Test suite with a mocked Hammerspoon (`make test`).
 
 ### Fixed
@@ -32,6 +38,10 @@ Rewrite for yabai 7.x and Hammerspoon 1.x (Apple Silicon and Intel).
 - Indicators no longer appear above menus (#99).
 - No crash when yabai reports windows that frame grouping missed (#72); `inf`/`nan` frames no longer break JSON
   parsing.
+- Large yabai output no longer stalls refreshes (it is read from a file, since `hs.task` only drains pipes after a
+  process exits).
+- Switching to an app yabai does not track (Raycast, Alfred, …) no longer leaves a stack highlighted as focused.
+- Snapshots taken half-way through a yabai re-layout no longer make indicators flicker.
 - Pill indicators of unfocused stacks stay visible (#85).
 - Only the `stackline` global is defined; built-in `string`/`table` are no longer extended.
 
