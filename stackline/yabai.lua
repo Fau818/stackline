@@ -140,14 +140,18 @@ function yabai.exec(args, cb, timeout)
     local argv = { '-c', CAPTURE_SCRIPT, CAPTURE_TAG, out, state.path }
     for _, arg in ipairs(args) do argv[#argv + 1] = arg end
 
-    local finished, timer = false, nil
+    -- Hammerspoon keeps hs.task and hs.timer callbacks in its registry until the object itself is
+    -- collected. These callbacks reach each other's objects through the `task`/`timer` upvalues,
+    -- so finish() clears them; otherwise neither object could ever be freed.
+    local finished, task, timer = false, nil, nil
     local function finish(ok, stdout, err, code)
         finished = true
         if timer then timer:stop() end
+        task, timer = nil, nil
         cb(ok, stdout, err or '', code)
     end
 
-    local task = hs.task.new('/bin/sh', function(code, _, err)
+    task = hs.task.new('/bin/sh', function(code, _, err)
         -- A late callback after a timeout only cleans up whatever the killed process left behind.
         if finished then return os.remove(out) end
         finish(code == 0, slurp(out), err, code)
@@ -157,43 +161,49 @@ function yabai.exec(args, cb, timeout)
         finish(false, '', 'could not launch ' .. state.path, -1)
         return nil
     end
+    local started = task
 
     timer = hs.timer.doAfter(timeout or 3, function()
         if finished then return end
+        local running = task
         -- Report first: terminating fires the task callback, which must not win with an empty error.
         finish(false, '', ('timed out: %s %s'):format(state.path, table.concat(args, ' ')), -1)
         os.remove(out)
-        if task:isRunning() then task:terminate() end
+        if running and running:isRunning() then running:terminate() end
     end)
-    return task
+    return started
 end
 
 -- Runs `path` with `args` and calls `cb(ok, stdout, stderr, exitCode)` exactly once, reading stdout
 -- from a pipe: only for commands with little output, such as /bin/sh scripts. Returns the hs.task, or nil.
 function yabai.spawn(path, args, cb, timeout)
-    local finished, timer = false, nil
+    -- See yabai.exec for why finish() clears the task/timer upvalues.
+    local finished, task, timer = false, nil, nil
     local function finish(ok, out, err, code)
         if finished then return end
         finished = true
         if timer then timer:stop() end
+        task, timer = nil, nil
         cb(ok, out or '', err or '', code)
     end
 
-    local task = hs.task.new(path, function(code, out, err)
+    task = hs.task.new(path, function(code, out, err)
         finish(code == 0, out, err, code)
     end, args)
     if not task or not task:start() then
         finish(false, '', 'could not launch ' .. path, -1)
         return nil
     end
+    local started = task
 
     timer = hs.timer.doAfter(timeout or 3, function()
         if finished then return end
+        local running = task
         -- Report first: terminating fires the task callback, which must not win with an empty error.
         finish(false, '', ('timed out: %s %s'):format(path, table.concat(args, ' ')), -1)
-        if task:isRunning() then task:terminate() end
+        if running and running:isRunning() then running:terminate() end
     end)
-    return task
+    return started
 end
 
 -- Returns the Lua value decoded from yabai's JSON output, or nil plus an error message.

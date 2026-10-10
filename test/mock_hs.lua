@@ -87,14 +87,34 @@ function M.install()
         end,
     }
 
+    -- Hammerspoon keeps Lua callbacks in a registry (LuaSkin's refTable) that is a garbage
+    -- collection root; an object's callback is released only when the object itself is collected.
+    -- Modelling that lets tests catch reference cycles that would leak in the real app.
+    ctl.registry = {}
+    local lastRef = 0
+    local function ref(value)
+        lastRef = lastRef + 1
+        ctl.registry[lastRef] = value
+        return lastRef
+    end
+    local function unref(r)
+        if r then ctl.registry[r] = nil end
+        return nil
+    end
+
     -- hs.timer -----------------------------------------------------------------------------
+    -- `native` is what the run loop holds; the returned table stands in for the Lua userdata.
     local function addTimer(delay, fn, every)
-        local timer = { at = ctl.now + delay, fn = fn, every = every, active = true }
-        function timer:stop() self.active = false return self end
-        function timer:running() return self.active end
-        function timer:start() self.active = true; self.at = ctl.now + (self.every or delay) return self end
-        ctl.timers[#ctl.timers + 1] = timer
-        return timer
+        local native = { at = ctl.now + delay, every = every, active = true, fnRef = ref(fn) }
+        ctl.timers[#ctl.timers + 1] = native
+        local timer = {}
+        function timer:stop() native.active = false return self end
+        function timer:running() return native.active end
+        function timer:start() native.active = true; native.at = ctl.now + (native.every or delay) return self end
+        return setmetatable(timer, { __gc = function()
+            native.active = false -- collecting a timer stops it, as in Hammerspoon
+            native.fnRef = unref(native.fnRef)
+        end })
     end
     hs.timer = {
         doAfter = function(delay, fn) return addTimer(delay, fn) end,
@@ -104,43 +124,70 @@ function M.install()
     }
 
     -- hs.task --------------------------------------------------------------------------------
+    -- Like timers, a task's callback lives in the registry until the task is collected, and
+    -- Hammerspoon holds a self reference from creation until the process terminates.
     hs.task = {
         new = function(path, callback, a, b)
             local args = (type(a) == 'table') and a or b or {}
-            local task = { path = path, args = args, callback = callback, running = false, terminated = false }
+            local native = {
+                path = path, args = args, running = false, terminated = false,
+                callbackRef = callback and ref(callback) or nil,
+            }
+            local task = {}
             function task:start()
-                self.running = true
-                ctl.taskLog[#ctl.taskLog + 1] = self
-                ctl.pendingTasks[#ctl.pendingTasks + 1] = self
+                native.running = true
+                ctl.taskLog[#ctl.taskLog + 1] = { path = path, args = args }
+                ctl.pendingTasks[#ctl.pendingTasks + 1] = native
                 return self
             end
-            function task:isRunning() return self.running end
+            function task:isRunning() return native.running end
             function task:terminate()
-                if not self.running then return self end
-                self.running = false
-                self.terminated = true
-                if self.callback then self.callback(15, '', '') end
+                if not native.running then return self end
+                native.terminated = true
+                ctl.complete(native, 15, '', '')
                 return self
             end
+            setmetatable(task, { __gc = function()
+                native.callbackRef = unref(native.callbackRef)
+                native.selfRef = unref(native.selfRef)
+            end })
+            native.selfRef = ref(task)
             return task
         end,
     }
 
+    -- Finishes a task: runs its callback, then drops Hammerspoon's self reference.
+    function ctl.complete(native, code, out, err)
+        if not native.running then return end
+        native.running = false
+        local callback = native.callbackRef and ctl.registry[native.callbackRef]
+        if callback then callback(code, out or '', err or '') end
+        native.selfRef = unref(native.selfRef)
+    end
+
     -- Completes launched tasks (including ones launched by callbacks) until none are pending.
     function ctl.flushTasks()
         while #ctl.pendingTasks > 0 do
-            local task = table.remove(ctl.pendingTasks, 1)
-            if task.running then
+            local native = table.remove(ctl.pendingTasks, 1)
+            if native.running then
                 local code, out, err = 0, '', ''
-                if ctl.taskHandler then code, out, err = ctl.taskHandler(task.path, task.args, task) end
+                if ctl.taskHandler then code, out, err = ctl.taskHandler(native.path, native.args, native) end
                 if code == nil then
-                    ctl.hungTasks[#ctl.hungTasks + 1] = task
+                    ctl.hungTasks[#ctl.hungTasks + 1] = native
                 else
-                    task.running = false
-                    if task.callback then task.callback(code, out or '', err or '') end
+                    ctl.complete(native, code, out, err)
                 end
             end
         end
+    end
+
+    -- Returns the number of live registry references (callbacks and self references).
+    function ctl.liveRefs()
+        collectgarbage('collect')
+        collectgarbage('collect')
+        local n = 0
+        for _ in pairs(ctl.registry) do n = n + 1 end
+        return n
     end
 
     -- Advances the fake clock by `dt` seconds, completing tasks and firing due timers in order.
@@ -155,7 +202,8 @@ function M.install()
             if not nextTimer then break end
             ctl.now = math.max(ctl.now, nextTimer.at)
             if nextTimer.every then nextTimer.at = nextTimer.at + nextTimer.every else nextTimer.active = false end
-            nextTimer.fn(nextTimer)
+            local fn = nextTimer.fnRef and ctl.registry[nextTimer.fnRef]
+            if fn then fn() end -- Hammerspoon calls timer callbacks without arguments
         end
         ctl.now = target
         ctl.flushTasks()

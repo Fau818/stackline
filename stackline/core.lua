@@ -126,7 +126,9 @@ local function refresh(done)
             -- half-way through a change. Keep what is drawn and look again shortly, a few times.
             if info and info.inconsistent > 0 and state.retries < MAX_RETRIES then
                 state.retries = state.retries + 1
-                hs.timer.doAfter(RETRY_DELAY, guarded('retry', function()
+                -- Keep a reference: Hammerspoon stops a timer whose Lua object is collected.
+                state.retryTimer = hs.timer.doAfter(RETRY_DELAY, guarded('retry', function()
+                    state.retryTimer = nil
                     if state.initialized then state.scheduler:request() end
                 end))
                 return
@@ -330,6 +332,7 @@ function stackline.stop()
     state.scheduler:stop()
     state.health:stop()
     if state.poll then state.poll:stop() end
+    if state.retryTimer then state.retryTimer:stop() end
     if state.port then state.port:delete() end
     for _, watcher in ipairs(state.watchers) do watcher:stop() end
     render.clear(0)

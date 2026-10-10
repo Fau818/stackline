@@ -15,6 +15,7 @@ local SPECS = {
     'test.render_spec',
     'test.signals_spec',
     'test.core_spec',
+    'test.leak_spec',
 }
 
 for _, spec in ipairs(SPECS) do

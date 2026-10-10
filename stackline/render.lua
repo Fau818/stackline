@@ -125,6 +125,8 @@ local function retire(kind, canvas, showing, fade)
     pending.timer = hs.timer.doAfter(fade + 0.05, function()
         if not fading[pending] then return end
         fading[pending] = nil
+        -- The callback reaches its own timer through `pending`; drop it so the timer can be freed.
+        pending.timer = nil
         stash(kind, canvas)
     end)
 end
@@ -336,7 +338,8 @@ function render.clear(fade)
         pool[kind] = {}
     end
     for pending in pairs(fading) do
-        pending.timer:stop()
+        if pending.timer then pending.timer:stop() end
+        pending.timer = nil
         pending.canvas:delete()
     end
     fading = {}
